@@ -579,11 +579,10 @@ function Get-StateSnapshot {
         return [pscustomobject]@{ Complete = $false; AuthoritativeResolved = $false; Database = $databases[0]; Threads = @(); Edges = @() }
     }
     $pythonPath = Resolve-ExecutablePath -LiteralPath ([string]$python.Path)
-    $pythonRoot = [IO.Path]::GetPathRoot($pythonPath)
     $helperPath = [IO.Path]::GetFullPath($helper)
     $helperRoot = [IO.Path]::GetPathRoot($helperPath)
     if (
-        -not (Test-NoReparseWithinRoot -Root $pythonRoot -LiteralPath $pythonPath -Category 'python-runtime' -LinksOnly) -or
+        -not (Test-Path -LiteralPath $pythonPath -PathType Leaf) -or
         -not (Test-NoReparseWithinRoot -Root $helperRoot -LiteralPath $helperPath -Category 'state-helper' -LinksOnly)
     ) {
         return [pscustomobject]@{ Complete = $false; AuthoritativeResolved = $false; Database = $databases[0]; Threads = @(); Edges = @() }
