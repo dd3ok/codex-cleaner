@@ -19,6 +19,7 @@ Audit and reduce Codex storage on Windows, macOS, and Linux without breaking cur
 - Treat raw generated images as UI task assets. Deleting their task directory can remove images from the Codex task even when a project copy exists.
 - Treat a matching project image as evidence of a copy, not automatic deletion permission. Protect unmatched and ambiguous images.
 - Never edit `state_*.sqlite`. Never delete a SQLite database, `-wal`, or `-shm` file directly.
+- Refuse state inspection when `-wal` or `-shm` sidecars are present. Require an offline, quiescent state database; never open an active WAL merely to classify cleanup candidates.
 - On every supported OS, use platform-native, case-correct path comparison. Validate the exact absolute target and its containment from the filesystem root through every ancestor, target, and traversed descendant. Reject symbolic links, junctions, and nested mount points, revalidate immediately before mutation, and operate on exact paths only.
 - Never use broad globs, environment-variable-expanded roots, home directories, or workspace roots as recursive deletion targets.
 - Do not create a report by default. Summarize in the response. Create one report only when explicitly requested, at an explicit path, and remove temporary audit artifacts.

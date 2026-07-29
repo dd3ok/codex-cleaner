@@ -178,7 +178,7 @@ Run the isolated regression suite:
 python -I -B .\codex-cleaner\scripts\test_codex_storage_snapshot.py
 ```
 
-The suite uses synthetic temporary Codex trees. It covers state/rollout consistency, relocated SQLite state, active WAL handling, duplicate and missing records, generated-asset ambiguity, current-task graph protection, symbolic links or Windows junctions, and multiple state databases. GitHub Actions runs it on Windows, Ubuntu, and macOS. It must not modify live Codex data.
+The suite uses synthetic temporary Codex trees. It covers state/rollout consistency, relocated SQLite state, mutation-free active-WAL refusal, duplicate and missing records, generated-asset ambiguity, current-task graph protection, symbolic links or Windows junctions, and multiple state databases. GitHub Actions runs it on Windows, Ubuntu, and macOS. It must not modify live Codex data.
 
 ## Important limitations
 
@@ -186,6 +186,7 @@ The suite uses synthetic temporary Codex trees. It covers state/rollout consiste
 - The snapshot itself contains no destructive primitives.
 - Historical content and regenerable data always require an exact later selection.
 - Task deletion must use a supported Codex task interface, not direct state-database edits.
+- State inspection requires an offline, quiescent database when WAL/SHM sidecars are present.
 - SQLite log maintenance is allowed only during a confirmed offline window; state databases are never compacted.
 - The skill does not run in the background or create scheduled cleanup automatically.
 - Platform-specific app cache paths are discovered from installed processes and supported configuration rather than guessed.

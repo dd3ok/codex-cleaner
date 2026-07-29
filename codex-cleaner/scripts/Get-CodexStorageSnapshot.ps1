@@ -583,8 +583,8 @@ function Get-StateSnapshot {
     $helperPath = [IO.Path]::GetFullPath($helper)
     $helperRoot = [IO.Path]::GetPathRoot($helperPath)
     if (
-        -not (Test-NoReparseWithinRoot -Root $pythonRoot -LiteralPath $pythonPath -Category 'python-runtime') -or
-        -not (Test-NoReparseWithinRoot -Root $helperRoot -LiteralPath $helperPath -Category 'state-helper')
+        -not (Test-NoReparseWithinRoot -Root $pythonRoot -LiteralPath $pythonPath -Category 'python-runtime' -LinksOnly) -or
+        -not (Test-NoReparseWithinRoot -Root $helperRoot -LiteralPath $helperPath -Category 'state-helper' -LinksOnly)
     ) {
         return [pscustomobject]@{ Complete = $false; AuthoritativeResolved = $false; Database = $databases[0]; Threads = @(); Edges = @() }
     }

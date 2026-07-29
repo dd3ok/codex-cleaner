@@ -235,7 +235,7 @@ def main() -> int:
         assert before == after, "snapshot changed the fixture"
         assert baseline["SchemaVersion"] == 4
         assert "Complete" not in baseline
-        assert baseline["ScanComplete"] is True
+        assert baseline["ScanComplete"] is True, baseline["Errors"]
         assert baseline["ReviewClassificationComplete"] is True
         assert baseline["Safety"]["AnalysisOnly"] is True
         assert baseline["Safety"]["SnapshotAuthorizesDeletion"] is False
@@ -553,14 +553,16 @@ def main() -> int:
         helper = script.with_name("read_codex_state.py")
         helper_run = subprocess.run(
             [sys.executable, "-I", "-B", str(helper), str(wal_database)],
-            check=True,
             capture_output=True,
             text=True,
             encoding="utf-8",
         )
-        assert json.loads(helper_run.stdout)["complete"] is True
+        assert helper_run.returncode != 0
+        helper_payload = json.loads(helper_run.stdout)
+        assert helper_payload["complete"] is False
+        assert "WAL/SHM sidecars are present" in helper_payload["errors"][0]
         wal_after = selected_file_manifest(wal_paths)
-        assert wal_before == wal_after, "read-only helper changed DB/WAL/SHM"
+        assert wal_before == wal_after, "WAL refusal changed DB/WAL/SHM"
         wal_connection.close()
 
         invalid_range = subprocess.run(

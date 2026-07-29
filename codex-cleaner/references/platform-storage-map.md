@@ -57,7 +57,7 @@ The supplied snapshot is analysis-only and is never a delete list. The following
 
 - the scan is complete with no critical read errors;
 - the current task ID was supplied and its full parent/child connected family was protected;
-- the authoritative state database was opened read-only;
+- the authoritative state database had no WAL/SHM sidecars and was opened immutable/read-only;
 - every rollout filename contains one canonical UUID and its first `session_meta` record contains the same ID;
 - state task IDs and rollout IDs agree with no missing, stray, or duplicate IDs;
 - expected image and visualization layouts were measured without ambiguity;
@@ -69,7 +69,9 @@ Even when all conditions pass, each record remains protected and review-only. A 
 
 ## Task consistency and activity
 
-Read task state with SQLite URI `mode=ro` and `PRAGMA query_only=ON`. Compare state IDs and recorded rollout paths with both rollout trees. Compute activity conservatively as the latest available value among state update time, rollout metadata/content, and filesystem timestamps.
+Read quiescent task state with SQLite URI `mode=ro&immutable=1` and `PRAGMA query_only=ON`. Compare state IDs and recorded rollout paths with both rollout trees. Compute activity conservatively as the latest available value among state update time, rollout metadata/content, and filesystem timestamps.
+
+Do not open a state database when `-wal` or `-shm` exists. SQLite WAL readers can interact with the shared-memory index differently across platforms. Require an offline, quiescent database and use `mode=ro&immutable=1`; if a sidecar appears or any fingerprint changes during the read, discard the result and protect all dependent records.
 
 Protect a task when any of these applies:
 

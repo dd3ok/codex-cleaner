@@ -178,7 +178,7 @@ pwsh -NoProfile -File $snapshotScript `
 python -I -B .\codex-cleaner\scripts\test_codex_storage_snapshot.py
 ```
 
-테스트는 임시로 만든 합성 Codex 트리만 사용합니다. 상태·rollout 일관성, 별도 SQLite 상태 루트, 활성 WAL, 중복·누락 기록, 생성 자산의 모호성, 현재 task 그래프 보호, symbolic link 또는 Windows junction 및 복수 상태 데이터베이스를 검사합니다. GitHub Actions가 Windows, Ubuntu 및 macOS에서 실행하며 실제 Codex 데이터는 변경하지 않아야 합니다.
+테스트는 임시로 만든 합성 Codex 트리만 사용합니다. 상태·rollout 일관성, 별도 SQLite 상태 루트, 실제 파일을 변경하지 않는 활성 WAL 거부, 중복·누락 기록, 생성 자산의 모호성, 현재 task 그래프 보호, symbolic link 또는 Windows junction 및 복수 상태 데이터베이스를 검사합니다. GitHub Actions가 Windows, Ubuntu 및 macOS에서 실행하며 실제 Codex 데이터는 변경하지 않아야 합니다.
 
 ## 중요한 제한 사항
 
@@ -186,6 +186,7 @@ python -I -B .\codex-cleaner\scripts\test_codex_storage_snapshot.py
 - 스냅샷에는 삭제나 프로세스 종료 기능이 들어 있지 않습니다.
 - 과거 콘텐츠와 재생성 가능한 데이터는 항상 정확한 후속 선택이 필요합니다.
 - task 삭제는 상태 DB를 직접 편집하지 않고 지원되는 Codex 인터페이스를 사용해야 합니다.
+- WAL/SHM sidecar가 있으면 Codex가 완전히 종료된 안정 상태에서만 상태 DB를 검사합니다.
 - SQLite 로그 최적화는 Codex가 완전히 종료된 오프라인 환경에서만 허용하며 상태 DB는 절대 최적화하지 않습니다.
 - 백그라운드 상주 또는 정기 자동 정리를 자동으로 만들지 않습니다.
 - OS별 앱 캐시 경로는 추측하지 않고 설치된 프로세스와 지원되는 설정에서 확인합니다.
