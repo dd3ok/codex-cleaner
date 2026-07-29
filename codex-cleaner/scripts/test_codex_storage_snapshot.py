@@ -60,9 +60,30 @@ def make_old(root: Path) -> None:
         os.utime(path, (old, old))
 
 
+def create_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def remove_directory_link(link: Path) -> None:
+    if os.name == "nt":
+        os.rmdir(link)
+    else:
+        link.unlink()
+
+
 def run_snapshot(
     script: Path,
     codex_root: Path,
+    state_root: Path | None = None,
     project_root: Path | None = None,
     protected: str | None = PARENT_ID,
     top: int | None = None,
@@ -78,6 +99,8 @@ def run_snapshot(
     ]
     if protected is not None:
         command.extend(["-CurrentTaskId", protected])
+    if state_root is not None:
+        command.extend(["-StateRoot", str(state_root)])
     if project_root is not None:
         command.extend(["-ProjectRoot", str(project_root)])
     if top is not None:
@@ -101,7 +124,8 @@ def main() -> int:
         "ExpiresAtUtc",
         "canonical snapshot SHA-256",
         "PID reuse",
-        "volume root through every ancestor",
+        "filesystem root through every ancestor",
+        "symbolic links, junctions, and nested mount points",
         "never overwrite or adopt a pre-existing path",
         "No unneeded current-run creation-ledger artifacts remain",
     ]
@@ -200,10 +224,10 @@ def main() -> int:
         make_old(codex_root)
 
         before = tree_manifest(temp_root)
-        baseline = run_snapshot(script, codex_root, project_root)
+        baseline = run_snapshot(script, codex_root, project_root=project_root)
         after = tree_manifest(temp_root)
         assert before == after, "snapshot changed the fixture"
-        assert baseline["SchemaVersion"] == 3
+        assert baseline["SchemaVersion"] == 4
         assert "Complete" not in baseline
         assert baseline["ScanComplete"] is True
         assert baseline["ReviewClassificationComplete"] is True
@@ -214,9 +238,22 @@ def main() -> int:
         assert baseline["RecordsAuthorizeDeletion"] is False
         assert baseline["PathRecordsAuthorizeDeletion"] is False
         assert baseline["Safety"]["RecordsAuthorizeDeletion"] is False
+        expected_platform = (
+            "Windows"
+            if os.name == "nt"
+            else "macOS"
+            if sys.platform == "darwin"
+            else "Linux"
+        )
+        assert baseline["Platform"]["Name"] == expected_platform
+        assert baseline["Platform"]["MountInventoryComplete"] is True
+        assert baseline["Safety"]["PlatformPathSafetyComplete"] is True
+        assert baseline["Platform"]["PathCaseSensitive"] is (os.name != "nt")
         assert baseline["CodexRoot"]["Path"] == str(codex_root.resolve())
         assert baseline["CodexRoot"]["MeasurementOnly"] is True
         assert baseline["CodexRoot"]["DeletionAuthorized"] is False
+        assert baseline["StateRoot"]["Path"] == str(codex_root.resolve())
+        assert baseline["StateRoot"]["DeletionAuthorized"] is False
         assert baseline["State"]["MeasurementOnly"] is True
         assert baseline["State"]["DeletionAuthorized"] is False
         assert baseline["State"]["Database"]["Path"] == str(database.resolve())
@@ -244,6 +281,7 @@ def main() -> int:
             assert record["MeasurementOnly"] is True
             assert record["Classification"] == "EvidenceOnly"
             assert record["ContentUniqueness"] == "NotEvaluated"
+            assert record["UnsafePathEntries"] == 0
             assert record["AmbiguityReasons"]
         image_review_paths = {record["Path"] for record in image_records}
         image_ambiguous_paths = {
@@ -270,11 +308,28 @@ def main() -> int:
             for row in baseline["ReportScan"]["Items"]
         )
         assert report_paths == {"cleanup-report.md", "audit-summary.md", "handoff.txt"}
-        limited_reports = run_snapshot(script, codex_root, project_root, top=1)
+        state_home = temp_root / "state-home"
+        state_home.mkdir()
+        relocated_database = state_home / database.name
+        shutil.move(database, relocated_database)
+        relocated_state = run_snapshot(script, codex_root, state_root=state_home)
+        assert relocated_state["ScanComplete"] is True
+        assert relocated_state["StateRoot"]["Path"] == str(state_home.resolve())
+        assert relocated_state["State"]["Database"]["Path"] == str(
+            relocated_database.resolve()
+        )
+        shutil.move(relocated_database, database)
+        state_home.rmdir()
+
+        limited_reports = run_snapshot(
+            script, codex_root, project_root=project_root, top=1
+        )
         assert limited_reports["ReportScan"]["Total"] == 3
         assert limited_reports["ReportScan"]["Truncated"] is True
         assert len(limited_reports["ReportScan"]["Items"]) == 1
-        missing_project = run_snapshot(script, codex_root, temp_root / "missing-project")
+        missing_project = run_snapshot(
+            script, codex_root, project_root=temp_root / "missing-project"
+        )
         assert missing_project["ReviewClassificationComplete"] is False
         assert missing_project["ReportScan"]["Requested"] is True
         assert missing_project["ReportScan"]["Complete"] is False
@@ -349,6 +404,24 @@ def main() -> int:
         connection.commit()
         connection.close()
 
+        case_variant_path = str(child_rollout.resolve()).swapcase()
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "UPDATE threads SET rollout_path = ? WHERE id = ?",
+            (case_variant_path, CHILD_ID),
+        )
+        connection.commit()
+        connection.close()
+        case_result = run_snapshot(script, codex_root)
+        assert case_result["Safety"]["TaskConsistencyValid"] is (os.name == "nt")
+        connection = sqlite3.connect(database)
+        connection.execute(
+            "UPDATE threads SET rollout_path = ? WHERE id = ?",
+            (str(child_rollout.resolve()), CHILD_ID),
+        )
+        connection.commit()
+        connection.close()
+
         second_database = codex_root / "state_2.sqlite"
         shutil.copy2(database, second_database)
         multiple_databases = run_snapshot(script, codex_root)
@@ -408,28 +481,16 @@ def main() -> int:
         external_task.mkdir(parents=True)
         (external_task / "image.png").write_bytes(b"outside")
         os.replace(image_root, image_backup)
-        subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(image_root), str(external_images)],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
+        create_directory_link(image_root, external_images)
         reparse_root = run_snapshot(script, codex_root)
         assert reparse_root["ReviewClassificationComplete"] is False
         assert reparse_root["Safety"]["TaskAssetReviewClassificationComplete"] is False
         assert reparse_root["GeneratedImages"]["ReviewOnlyHistoricalAssetRecords"] == []
-        os.rmdir(image_root)
+        remove_directory_link(image_root)
         os.replace(image_backup, image_root)
 
         ancestor_link = temp_root / "ancestor-link"
-        subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(ancestor_link), str(temp_root)],
-            check=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
+        create_directory_link(ancestor_link, temp_root)
         try:
             ancestor_reparse = subprocess.run(
                 [
@@ -452,7 +513,7 @@ def main() -> int:
                 ancestor_reparse.stdout + ancestor_reparse.stderr
             )
         finally:
-            os.rmdir(ancestor_link)
+            remove_directory_link(ancestor_link)
 
         wal_database = temp_root / "wal_state.sqlite"
         wal_connection = sqlite3.connect(wal_database)

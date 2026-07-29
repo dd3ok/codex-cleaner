@@ -2,7 +2,9 @@
 
 [English](README.md)
 
-Codex Cleaner는 Windows의 Codex Desktop 및 CLI에 누적된 데이터를 분석하고 정리하기 위한 개인 스킬입니다. 현재 작업, 프로젝트, 스킬, 설정, 유일한 생성 이미지를 조용히 손상시키지 않는 것을 최우선으로 합니다.
+[![크로스플랫폼 검증](https://github.com/dd3ok/codex-cleaner/actions/workflows/validate.yml/badge.svg)](https://github.com/dd3ok/codex-cleaner/actions/workflows/validate.yml)
+
+Codex Cleaner는 Codex Desktop 및 CLI에 누적된 데이터를 분석하고 정리하기 위한 크로스플랫폼 개인 스킬입니다. Windows, macOS, Linux 및 WSL을 지원하며 현재 작업, 프로젝트, 스킬, 설정, 유일한 생성 이미지를 조용히 손상시키지 않는 것을 최우선으로 합니다.
 
 포함된 스냅샷 도구는 영구적으로 읽기 전용이며, 불확실하면 작업을 중단하는 실패-폐쇄 방식으로 동작합니다. 스냅샷에 표시된 항목은 검토용 근거일 뿐 삭제 권한이 아닙니다.
 
@@ -15,6 +17,7 @@ Codex Cleaner는 Windows의 Codex Desktop 및 CLI에 누적된 데이터를 분�
 - 다시 생성할 수 있는 프로젝트 캐시와 빌드 결과물
 - 과도하게 만들어진 정리 보고서와 감사 파일
 - 메모리를 점유할 수 있는 중복 또는 잔류 작업자 프로세스
+- OS별 symbolic link, junction, mount point, bind mount 및 경로 경계
 
 ## 안전 모델
 
@@ -35,6 +38,7 @@ Codex Cleaner는 분석과 변경을 분리합니다.
 
 - 현재 task와 연결된 모든 부모·자식 task
 - 전역 지침, 설정, 인증, `.codex/skills`, `.agents/skills`
+- `CODEX_HOME`, 실제 SQLite 상태 루트 및 확인되지 않은 OS별 앱 데이터
 - 프로젝트 소스, 추적 파일, 미추적 작업물 및 변경사항이 있는 저장소
 - 유일하거나 일치본이 없고, 모호하거나, 현재 task에 속한 생성 자산
 - `state_*.sqlite` 및 SQLite `-wal`·`-shm` 파일
@@ -45,6 +49,7 @@ Codex Cleaner는 분석과 변경을 분리합니다.
 
 ```text
 .
+├── .github/workflows/validate.yml
 ├── README.md
 ├── README.ko.md
 └── codex-cleaner/
@@ -52,7 +57,7 @@ Codex Cleaner는 분석과 변경을 분리합니다.
     ├── agents/
     │   └── openai.yaml
     ├── references/
-    │   └── windows-storage-map.md
+    │   └── platform-storage-map.md
     └── scripts/
         ├── Get-CodexStorageSnapshot.ps1
         ├── read_codex_state.py
@@ -61,12 +66,22 @@ Codex Cleaner는 분석과 변경을 분리합니다.
 
 README는 설치할 스킬 폴더 밖에 있으므로 Codex의 스킬 컨텍스트에 불필요하게 로드되지 않습니다.
 
+## 지원 플랫폼
+
+| 플랫폼 | 경로 안전 검사 |
+|---|---|
+| Windows | 대소문자를 구분하지 않는 포함 관계 검사와 junction, symbolic link, reparse point, ADS, device, UNC 보호 |
+| macOS | 보수적인 대소문자 구분과 symbolic link 및 네이티브 mount table 보호 |
+| Linux / WSL | 대소문자 구분과 symbolic link, `/proc/self/mountinfo`, nested mount, bind mount 보호 |
+
+운영체제 또는 mount 목록을 확정할 수 없으면 스냅샷은 실패-폐쇄 방식으로 분류를 중단합니다.
+
 ## 요구 사항
 
-- Windows 10 또는 11
+- Windows, macOS 또는 Linux
 - 개인 스킬을 지원하는 Codex Desktop 또는 Codex CLI
 - PowerShell 7 (`pwsh`)
-- 표준 라이브러리만 사용하는 Python 3
+- 표준 라이브러리만 사용하는 Python 3.10 이상
 
 ## 설치
 
@@ -97,6 +112,8 @@ Copy-Item -LiteralPath '.\codex-cleaner' -Destination $destination -Recurse
 ```
 
 Codex를 재시작하면 새 스킬을 인식합니다.
+
+Codex는 기본적으로 `~/.codex`인 `CODEX_HOME`을 사용합니다. SQLite 상태는 `CODEX_SQLITE_HOME`으로 옮길 수 있으며 `sqlite_home` 설정이 우선합니다. 공식 [Codex 환경 변수 문서](https://learn.chatgpt.com/docs/config-file/environment-variables)를 참고하세요.
 
 ## 사용법
 
@@ -131,12 +148,22 @@ pwsh -NoProfile -File $snapshotScript `
   -AsJson
 ```
 
+SQLite 상태가 `CODEX_HOME` 밖에 있다면 실제 위치를 명시합니다.
+
+```powershell
+pwsh -NoProfile -File $snapshotScript `
+  -CurrentTaskId '<current-task-uuid>' `
+  -StateRoot '<effective-sqlite-state-root>' `
+  -AsJson
+```
+
 다음 안전 게이트를 모두 통과해야 검토용 분류가 허용됩니다.
 
 - `ScanComplete`
 - `ReviewClassificationComplete`
 - `Safety.TaskConsistencyValid`
 - `Safety.AuthoritativeStateDatabaseResolved`
+- `Safety.PlatformPathSafetyComplete`
 - `Safety.CaptureStable`
 - `Safety.CurrentTaskProtectionProvided`
 - 비어 있는 `Errors`
@@ -151,7 +178,7 @@ pwsh -NoProfile -File $snapshotScript `
 python -I -B .\codex-cleaner\scripts\test_codex_storage_snapshot.py
 ```
 
-테스트는 임시로 만든 합성 Codex 트리만 사용합니다. 상태·rollout 일관성, 활성 SQLite WAL, 중복·누락 기록, 생성 자산의 모호성, 현재 task 그래프 보호, reparse point, 부모 junction 및 복수 상태 데이터베이스를 검사하며 실제 Codex 데이터는 변경하지 않아야 합니다.
+테스트는 임시로 만든 합성 Codex 트리만 사용합니다. 상태·rollout 일관성, 별도 SQLite 상태 루트, 활성 WAL, 중복·누락 기록, 생성 자산의 모호성, 현재 task 그래프 보호, symbolic link 또는 Windows junction 및 복수 상태 데이터베이스를 검사합니다. GitHub Actions가 Windows, Ubuntu 및 macOS에서 실행하며 실제 Codex 데이터는 변경하지 않아야 합니다.
 
 ## 중요한 제한 사항
 
@@ -161,6 +188,7 @@ python -I -B .\codex-cleaner\scripts\test_codex_storage_snapshot.py
 - task 삭제는 상태 DB를 직접 편집하지 않고 지원되는 Codex 인터페이스를 사용해야 합니다.
 - SQLite 로그 최적화는 Codex가 완전히 종료된 오프라인 환경에서만 허용하며 상태 DB는 절대 최적화하지 않습니다.
 - 백그라운드 상주 또는 정기 자동 정리를 자동으로 만들지 않습니다.
-- Codex 저장소 구조와 지원 인터페이스는 변경될 수 있으며 알 수 없는 구조는 보호합니다.
+- OS별 앱 캐시 경로는 추측하지 않고 설치된 프로세스와 지원되는 설정에서 확인합니다.
+- Codex 저장소 구조, mount 동작과 지원 인터페이스는 변경될 수 있으며 알 수 없는 구조는 보호합니다.
 
-재현 가능한 Windows 예외 사례와 개선안은 GitHub issue 및 pull request로 환영합니다.
+재현 가능한 Windows, macOS, Linux 및 WSL 예외 사례와 개선안은 GitHub issue 및 pull request로 환영합니다.

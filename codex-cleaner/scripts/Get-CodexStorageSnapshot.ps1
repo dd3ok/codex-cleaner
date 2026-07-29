@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [string]$CodexRoot = (Join-Path $env:USERPROFILE '.codex'),
+    [string]$CodexRoot,
+    [string]$StateRoot,
     [string[]]$ProjectRoot = @(),
     [ValidateRange(1, 1000)]
     [int]$Top = 20,
@@ -14,6 +15,48 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$platformName = if ($IsWindows) {
+    'Windows'
+}
+elseif ($IsLinux) {
+    'Linux'
+}
+elseif ($IsMacOS) {
+    'macOS'
+}
+else {
+    throw 'Unsupported operating system'
+}
+$pathComparison = if ($IsWindows) {
+    [StringComparison]::OrdinalIgnoreCase
+}
+else {
+    [StringComparison]::Ordinal
+}
+$pathComparer = if ($IsWindows) {
+    [StringComparer]::OrdinalIgnoreCase
+}
+else {
+    [StringComparer]::Ordinal
+}
+if ([string]::IsNullOrWhiteSpace($CodexRoot)) {
+    $configuredCodexHome = [Environment]::GetEnvironmentVariable('CODEX_HOME')
+    $CodexRoot = if ([string]::IsNullOrWhiteSpace($configuredCodexHome)) {
+        Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.codex'
+    }
+    else {
+        $configuredCodexHome
+    }
+}
+if ([string]::IsNullOrWhiteSpace($StateRoot)) {
+    $configuredStateHome = [Environment]::GetEnvironmentVariable('CODEX_SQLITE_HOME')
+    $StateRoot = if ([string]::IsNullOrWhiteSpace($configuredStateHome)) {
+        $CodexRoot
+    }
+    else {
+        $configuredStateHome
+    }
+}
 $uuidPattern = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 $rolloutNamePattern = "^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(?<id>$uuidPattern)$"
 $scanErrors = [Collections.Generic.List[string]]::new()
@@ -38,6 +81,168 @@ function Add-ScanIssue {
     }
 }
 
+function ConvertTo-PlatformPath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $candidate = $Path
+    if ($IsWindows) {
+        if ($candidate.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+            $candidate = '\\' + $candidate.Substring(8)
+        }
+        elseif ($candidate.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+            $candidate = $candidate.Substring(4)
+        }
+    }
+    try {
+        $fullPath = [IO.Path]::GetFullPath($candidate)
+        $rootPath = [IO.Path]::GetPathRoot($fullPath)
+        if ([string]::Equals(
+            $fullPath.TrimEnd('\', '/'),
+            $rootPath.TrimEnd('\', '/'),
+            $pathComparison
+        )) {
+            return $rootPath
+        }
+        $fullPath.TrimEnd('\', '/')
+    }
+    catch {
+        $candidate.TrimEnd('\', '/')
+    }
+}
+
+function ConvertFrom-MountEscapedPath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $Path.
+        Replace('\040', ' ').
+        Replace('\011', "`t").
+        Replace('\012', "`n").
+        Replace('\134', '\')
+}
+
+function Get-PlatformMountInventory {
+    $mounts = [Collections.Generic.HashSet[string]]::new($pathComparer)
+    if ($IsWindows) {
+        return [pscustomobject]@{
+            Complete = $true
+            Source = 'WindowsReparseMetadata'
+            Paths = $mounts
+            Errors = @()
+        }
+    }
+
+    $errors = [Collections.Generic.List[string]]::new()
+    if ($IsLinux) {
+        $mountInfoPath = '/proc/self/mountinfo'
+        if (-not (Test-Path -LiteralPath $mountInfoPath -PathType Leaf)) {
+            $errors.Add("$mountInfoPath is unavailable")
+        }
+        else {
+            try {
+                foreach ($line in [IO.File]::ReadLines($mountInfoPath)) {
+                    $separator = $line.IndexOf(' - ', [StringComparison]::Ordinal)
+                    if ($separator -lt 0) { continue }
+                    $fields = $line.Substring(0, $separator).Split(' ')
+                    if ($fields.Count -lt 5) { continue }
+                    $mountPath = ConvertFrom-MountEscapedPath -Path $fields[4]
+                    [void]$mounts.Add((ConvertTo-PlatformPath -Path $mountPath))
+                }
+            }
+            catch {
+                $errors.Add($_.Exception.Message)
+            }
+        }
+        return [pscustomobject]@{
+            Complete = ($errors.Count -eq 0 -and $mounts.Count -gt 0)
+            Source = 'proc-self-mountinfo'
+            Paths = $mounts
+            Errors = @($errors)
+        }
+    }
+
+    $mountCommand = Get-Command mount -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -eq $mountCommand) {
+        $errors.Add('mount command is unavailable')
+    }
+    else {
+        try {
+            $mountOutput = @(& $mountCommand.Source 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+                $errors.Add("mount command exited with code $LASTEXITCODE")
+            }
+            foreach ($line in $mountOutput) {
+                if ([string]$line -match '^.* on (?<path>.+) \([^)]+\)$') {
+                    $mountPath = ConvertFrom-MountEscapedPath -Path $Matches.path
+                    [void]$mounts.Add((ConvertTo-PlatformPath -Path $mountPath))
+                }
+            }
+        }
+        catch {
+            $errors.Add($_.Exception.Message)
+        }
+    }
+    [pscustomobject]@{
+        Complete = ($errors.Count -eq 0 -and $mounts.Count -gt 0)
+        Source = 'mount-command'
+        Paths = $mounts
+        Errors = @($errors)
+    }
+}
+
+function Test-IsLinkLike {
+    param([Parameter(Mandatory)][IO.FileSystemInfo]$Item)
+
+    if ($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        return $true
+    }
+    $linkType = $Item.PSObject.Properties['LinkType']
+    if ($null -ne $linkType -and -not [string]::IsNullOrWhiteSpace([string]$linkType.Value)) {
+        return $true
+    }
+    $false
+}
+
+function Resolve-ExecutablePath {
+    param([Parameter(Mandatory)][string]$LiteralPath)
+
+    $item = Get-Item -LiteralPath $LiteralPath -Force -ErrorAction Stop
+    if (-not (Test-IsLinkLike -Item $item)) {
+        return [IO.Path]::GetFullPath($item.FullName)
+    }
+    $target = [IO.File]::ResolveLinkTarget($item.FullName, $true)
+    if ($null -eq $target -or -not $target.Exists) {
+        throw "Executable link target cannot be resolved: $LiteralPath"
+    }
+    [IO.Path]::GetFullPath($target.FullName)
+}
+
+function Test-IsNestedMountPoint {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$LiteralPath
+    )
+
+    if ($IsWindows -or $null -eq $script:mountInventory -or -not $script:mountInventory.Complete) {
+        return $false
+    }
+    $rootPath = ConvertTo-PlatformPath -Path $Root
+    $candidatePath = ConvertTo-PlatformPath -Path $LiteralPath
+    (
+        -not [string]::Equals($rootPath, $candidatePath, $pathComparison) -and
+        $script:mountInventory.Paths.Contains($candidatePath)
+    )
+}
+
+function Test-IsUnsafeTraversalEntry {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][IO.FileSystemInfo]$Item
+    )
+
+    (Test-IsLinkLike -Item $Item) -or
+        (Test-IsNestedMountPoint -Root $Root -LiteralPath $Item.FullName)
+}
+
 function Get-CheckedChildren {
     param(
         [Parameter(Mandatory)][string]$LiteralPath,
@@ -51,27 +256,80 @@ function Get-CheckedChildren {
 
     if (-not (Test-Path -LiteralPath $LiteralPath -PathType Container)) {
         Add-ScanIssue -Category $Category -Message "directory not found: $LiteralPath" -Critical:$Critical
-        return [pscustomobject]@{ Items = @(); Complete = $false; Errors = @("directory not found") }
+        return [pscustomobject]@{
+            Items = @()
+            Complete = $false
+            Errors = @('directory not found')
+            UnsafePathEntries = @()
+        }
     }
 
     $issues = @()
-    $parameters = @{
-        LiteralPath   = $LiteralPath
-        Force         = $true
-        ErrorAction   = 'SilentlyContinue'
-        ErrorVariable = 'issues'
+    $unsafePathEntries = [Collections.Generic.List[string]]::new()
+    $items = [Collections.Generic.List[object]]::new()
+    $matchesSelection = {
+        param([IO.FileSystemInfo]$Item)
+        if ($File -and $Item.PSIsContainer) { return $false }
+        if ($Directory -and -not $Item.PSIsContainer) { return $false }
+        if ($Filter -and $Item.Name -notlike $Filter) { return $false }
+        $true
     }
-    if ($File) { $parameters.File = $true }
-    if ($Directory) { $parameters.Directory = $true }
-    if ($Recurse) { $parameters.Recurse = $true }
-    if ($Filter) { $parameters.Filter = $Filter }
 
-    try {
-        $items = @(Get-ChildItem @parameters)
+    if ($Recurse) {
+        $queue = [Collections.Generic.Queue[string]]::new()
+        $queue.Enqueue((ConvertTo-PlatformPath -Path $LiteralPath))
+        while ($queue.Count -gt 0) {
+            $currentPath = $queue.Dequeue()
+            $currentIssues = @()
+            try {
+                $children = @(
+                    Get-ChildItem -LiteralPath $currentPath -Force `
+                        -ErrorAction SilentlyContinue -ErrorVariable currentIssues
+                )
+            }
+            catch {
+                $currentIssues += $_
+                $children = @()
+            }
+            $issues += $currentIssues
+            foreach ($child in $children) {
+                if (Test-IsUnsafeTraversalEntry -Root $LiteralPath -Item $child) {
+                    $unsafePathEntries.Add($child.FullName)
+                    Add-ScanIssue -Category $Category -Message "unsafe link or nested mount skipped: $($child.FullName)" -Critical:$Critical
+                    continue
+                }
+                if (& $matchesSelection $child) {
+                    $items.Add($child)
+                }
+                if ($child.PSIsContainer) {
+                    $queue.Enqueue($child.FullName)
+                }
+            }
+        }
     }
-    catch {
-        $issues += $_
-        $items = @()
+    else {
+        $parameters = @{
+            LiteralPath   = $LiteralPath
+            Force         = $true
+            ErrorAction   = 'SilentlyContinue'
+            ErrorVariable = 'issues'
+        }
+        if ($File) { $parameters.File = $true }
+        if ($Directory) { $parameters.Directory = $true }
+        if ($Filter) { $parameters.Filter = $Filter }
+        try {
+            foreach ($item in @(Get-ChildItem @parameters)) {
+                if (Test-IsUnsafeTraversalEntry -Root $LiteralPath -Item $item) {
+                    $unsafePathEntries.Add($item.FullName)
+                    Add-ScanIssue -Category $Category -Message "unsafe link or nested mount skipped: $($item.FullName)" -Critical:$Critical
+                    continue
+                }
+                $items.Add($item)
+            }
+        }
+        catch {
+            $issues += $_
+        }
     }
 
     $messages = @(
@@ -82,9 +340,10 @@ function Get-CheckedChildren {
         }
     )
     [pscustomobject]@{
-        Items    = $items
-        Complete = ($messages.Count -eq 0)
-        Errors   = $messages
+        Items             = @($items)
+        Complete          = ($messages.Count -eq 0 -and $unsafePathEntries.Count -eq 0)
+        Errors            = $messages
+        UnsafePathEntries = @($unsafePathEntries)
     }
 }
 
@@ -92,7 +351,8 @@ function Test-NoReparseWithinRoot {
     param(
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$LiteralPath,
-        [Parameter(Mandatory)][string]$Category
+        [Parameter(Mandatory)][string]$Category,
+        [switch]$LinksOnly
     )
 
     try {
@@ -102,7 +362,7 @@ function Test-NoReparseWithinRoot {
             [string]::Equals(
                 $rootFullPath.TrimEnd('\', '/'),
                 $volumeRoot.TrimEnd('\', '/'),
-                [StringComparison]::OrdinalIgnoreCase
+                $pathComparison
             )
         ) {
             $volumeRoot
@@ -119,8 +379,8 @@ function Test-NoReparseWithinRoot {
             $rootPath + [IO.Path]::DirectorySeparatorChar
         }
         if (
-            -not [string]::Equals($rootComparable, $targetPath, [StringComparison]::OrdinalIgnoreCase) -and
-            -not $targetPath.StartsWith($rootBoundary, [StringComparison]::OrdinalIgnoreCase)
+            -not [string]::Equals($rootComparable, $targetPath, $pathComparison) -and
+            -not $targetPath.StartsWith($rootBoundary, $pathComparison)
         ) {
             Add-ScanIssue -Category $Category -Message "path escapes validation root: $targetPath" -Critical
             return $false
@@ -139,8 +399,12 @@ function Test-NoReparseWithinRoot {
 
         foreach ($path in $paths) {
             $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
-            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                Add-ScanIssue -Category $Category -Message "reparse point in path chain: $($item.FullName)" -Critical
+            if (Test-IsLinkLike -Item $item) {
+                Add-ScanIssue -Category $Category -Message "symbolic link or reparse point in path chain: $($item.FullName)" -Critical
+                return $false
+            }
+            if (-not $LinksOnly -and (Test-IsNestedMountPoint -Root $rootPath -LiteralPath $item.FullName)) {
+                Add-ScanIssue -Category $Category -Message "nested mount point in path chain: $($item.FullName)" -Critical
                 return $false
             }
         }
@@ -168,12 +432,13 @@ function Measure-Tree {
             MaxLastWriteTimeUtc = $null
             MeasurementComplete = $true
             ReparsePoints       = 0
+            UnsafePathEntries   = 0
             Errors              = @()
         }
     }
 
     $item = Get-Item -LiteralPath $LiteralPath -Force
-    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+    if (Test-IsLinkLike -Item $item) {
         return [pscustomobject]@{
             Exists              = $true
             Files               = 0
@@ -182,7 +447,8 @@ function Measure-Tree {
             MaxLastWriteTimeUtc = $item.LastWriteTimeUtc
             MeasurementComplete = $false
             ReparsePoints       = 1
-            Errors              = @('reparse target was not traversed')
+            UnsafePathEntries   = 1
+            Errors              = @('link target was not traversed')
         }
     }
     if (-not $item.PSIsContainer) {
@@ -194,6 +460,7 @@ function Measure-Tree {
             MaxLastWriteTimeUtc = $item.LastWriteTimeUtc
             MeasurementComplete = $true
             ReparsePoints       = [int][bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+            UnsafePathEntries   = 0
             Errors              = @()
         }
     }
@@ -206,8 +473,9 @@ function Measure-Tree {
     $maxLastWriteTimeUtc = ($timestamps | Sort-Object -Descending | Select-Object -First 1)
     $reparsePoints = @(
         @($item) + @($listing.Items) |
-            Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }
+            Where-Object { Test-IsLinkLike -Item $_ }
     ).Count
+    $unsafePathEntries = $reparsePoints + @($listing.UnsafePathEntries).Count
 
     [pscustomobject]@{
         Exists              = $true
@@ -217,6 +485,7 @@ function Measure-Tree {
         MaxLastWriteTimeUtc = $maxLastWriteTimeUtc
         MeasurementComplete = $listing.Complete
         ReparsePoints       = $reparsePoints
+        UnsafePathEntries   = $unsafePathEntries
         Errors              = @($listing.Errors)
     }
 }
@@ -307,7 +576,7 @@ function Get-StateSnapshot {
         Add-ScanIssue -Category 'state-database' -Message 'Python or read_codex_state.py is unavailable' -Critical
         return [pscustomobject]@{ Complete = $false; AuthoritativeResolved = $false; Database = $databases[0]; Threads = @(); Edges = @() }
     }
-    $pythonPath = [IO.Path]::GetFullPath($python.Source)
+    $pythonPath = Resolve-ExecutablePath -LiteralPath $python.Source
     $pythonRoot = [IO.Path]::GetPathRoot($pythonPath)
     $helperPath = [IO.Path]::GetFullPath($helper)
     $helperRoot = [IO.Path]::GetPathRoot($helperPath)
@@ -345,19 +614,7 @@ function Get-StateSnapshot {
 function ConvertTo-ComparablePath {
     param([Parameter(Mandatory)][string]$Path)
 
-    $candidate = $Path
-    if ($candidate.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
-        $candidate = '\\' + $candidate.Substring(8)
-    }
-    elseif ($candidate.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
-        $candidate = $candidate.Substring(4)
-    }
-    try {
-        [IO.Path]::GetFullPath($candidate).TrimEnd('\', '/')
-    }
-    catch {
-        $candidate.TrimEnd('\', '/')
-    }
+    ConvertTo-PlatformPath -Path $Path
 }
 
 function Get-ItemSetSignature {
@@ -467,6 +724,7 @@ function New-TaskDirectoryRecord {
         if ($isProtected) { 'ProtectedTaskFamily' }
         if (-not $measurement.MeasurementComplete) { 'IncompleteMeasurement' }
         if ($measurement.ReparsePoints -gt 0) { 'ReparsePointDetected' }
+        if ($measurement.UnsafePathEntries -gt 0) { 'UnsafeLinkOrMountDetected' }
         'ContentUniquenessNotEvaluated'
     )
     [pscustomobject]@{
@@ -478,6 +736,7 @@ function New-TaskDirectoryRecord {
         MaxLastWriteTimeUtc = $measurement.MaxLastWriteTimeUtc
         MeasurementComplete = $measurement.MeasurementComplete
         ReparsePoints       = $measurement.ReparsePoints
+        UnsafePathEntries   = $measurement.UnsafePathEntries
         ReferencedByRollout = $referencedByRollout
         ReferencedByState   = $referencedByState
         Protected           = $isProtected
@@ -511,7 +770,7 @@ function Get-ReportCandidates {
         [StringComparer]::OrdinalIgnoreCase
     )
     $namePattern = '(?i)(^|[-_. ])(report|audit|summary|handoff|contact[-_ ]?sheet|cleanup)([-_. ]|$)'
-    $seenPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $seenPaths = [Collections.Generic.HashSet[string]]::new($pathComparer)
     $reviewRecords = [Collections.Generic.List[object]]::new()
     $skippedRoots = [Collections.Generic.List[string]]::new()
     $skippedReparsePaths = [Collections.Generic.List[string]]::new()
@@ -532,8 +791,8 @@ function Get-ReportCandidates {
 
         while ($queue.Count -gt 0) {
             $directory = $queue.Dequeue()
-            if ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                Add-ScanIssue -Category 'report-scan' -Message "skipped reparse directory: $($directory.FullName)"
+            if (Test-IsUnsafeTraversalEntry -Root $resolvedRoot -Item $directory) {
+                Add-ScanIssue -Category 'report-scan' -Message "skipped unsafe link or nested mount: $($directory.FullName)"
                 $skippedReparsePaths.Add($directory.FullName)
                 $complete = $false
                 continue
@@ -621,17 +880,39 @@ function Get-ReportCandidates {
     }
 }
 
+$script:mountInventory = Get-PlatformMountInventory
+if (-not $script:mountInventory.Complete) {
+    foreach ($mountError in @($script:mountInventory.Errors)) {
+        Add-ScanIssue -Category 'platform-mount-inventory' -Message ([string]$mountError) -Critical
+    }
+    if (@($script:mountInventory.Errors).Count -eq 0) {
+        Add-ScanIssue -Category 'platform-mount-inventory' -Message 'mount inventory is incomplete' -Critical
+    }
+}
+
 $resolvedCodexRoot = [IO.Path]::GetFullPath($CodexRoot)
 if (-not (Test-Path -LiteralPath $resolvedCodexRoot -PathType Container)) {
     throw "Codex root not found: $resolvedCodexRoot"
 }
 $codexVolumeRoot = [IO.Path]::GetPathRoot($resolvedCodexRoot)
-if (-not (Test-NoReparseWithinRoot -Root $codexVolumeRoot -LiteralPath $resolvedCodexRoot -Category 'codex-root-ancestors')) {
+if (-not (Test-NoReparseWithinRoot -Root $codexVolumeRoot -LiteralPath $resolvedCodexRoot -Category 'codex-root-ancestors' -LinksOnly)) {
     throw "Codex root ancestor chain is unsafe: $resolvedCodexRoot"
 }
 $codexRootItem = Get-Item -LiteralPath $resolvedCodexRoot -Force
-if ($codexRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-    Add-ScanIssue -Category 'codex-root' -Message 'Codex root is a reparse point' -Critical
+if (Test-IsLinkLike -Item $codexRootItem) {
+    Add-ScanIssue -Category 'codex-root' -Message 'Codex root is a symbolic link or reparse point' -Critical
+}
+$resolvedStateRoot = [IO.Path]::GetFullPath($StateRoot)
+if (-not (Test-Path -LiteralPath $resolvedStateRoot -PathType Container)) {
+    throw "Codex state root not found: $resolvedStateRoot"
+}
+$stateVolumeRoot = [IO.Path]::GetPathRoot($resolvedStateRoot)
+if (-not (Test-NoReparseWithinRoot -Root $stateVolumeRoot -LiteralPath $resolvedStateRoot -Category 'state-root-ancestors' -LinksOnly)) {
+    throw "Codex state root ancestor chain is unsafe: $resolvedStateRoot"
+}
+$stateRootItem = Get-Item -LiteralPath $resolvedStateRoot -Force
+if (Test-IsLinkLike -Item $stateRootItem) {
+    Add-ScanIssue -Category 'state-root' -Message 'Codex state root is a symbolic link or reparse point' -Critical
 }
 
 $sessionRoot = Join-Path $resolvedCodexRoot 'sessions'
@@ -644,7 +925,12 @@ $archiveRootSafe = Test-NoReparseWithinRoot -Root $resolvedCodexRoot -LiteralPat
 $imageRootSafe = Test-NoReparseWithinRoot -Root $resolvedCodexRoot -LiteralPath $imageRoot -Category 'generated-image-directories'
 $visualRootSafe = Test-NoReparseWithinRoot -Root $resolvedCodexRoot -LiteralPath $visualRoot -Category 'visualization-directories'
 
-$emptyIncompleteListing = [pscustomobject]@{ Items = @(); Complete = $false; Errors = @('unsafe or unavailable root') }
+$emptyIncompleteListing = [pscustomobject]@{
+    Items = @()
+    Complete = $false
+    Errors = @('unsafe or unavailable root')
+    UnsafePathEntries = @()
+}
 $sessionListing = if ($sessionRootSafe) {
     Get-CheckedChildren -LiteralPath $sessionRoot -File -Recurse -Filter '*.jsonl' -Category 'sessions' -Critical
 }
@@ -679,7 +965,7 @@ $rolloutScanComplete = (
     $duplicateRolloutIds.Count -eq 0
 )
 
-$stateSnapshot = Get-StateSnapshot -Root $resolvedCodexRoot
+$stateSnapshot = Get-StateSnapshot -Root $resolvedStateRoot
 $stateSignature = Get-StateSignature -Snapshot $stateSnapshot
 $stateIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($thread in $stateSnapshot.Threads) {
@@ -708,7 +994,7 @@ foreach ($thread in $stateSnapshot.Threads) {
     if (-not [string]::Equals(
         $normalizedStatePath,
         $rolloutPathById[$threadId],
-        [StringComparison]::OrdinalIgnoreCase
+        $pathComparison
     )) {
         $rolloutPathMismatches.Add([pscustomobject]@{
             TaskId = $threadId
@@ -788,8 +1074,8 @@ $imageDirectoryListing = if ($imageRootSafe) {
 else { $emptyIncompleteListing }
 $imageTaskDirectories = [Collections.Generic.List[IO.DirectoryInfo]]::new()
 foreach ($item in $imageDirectoryListing.Items) {
-    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-        Add-ScanIssue -Category 'generated-image-directories' -Message "reparse item in asset tree: $($item.FullName)" -Critical
+    if (Test-IsUnsafeTraversalEntry -Root $imageRoot -Item $item) {
+        Add-ScanIssue -Category 'generated-image-directories' -Message "unsafe link or nested mount in asset tree: $($item.FullName)" -Critical
         continue
     }
     $relative = [IO.Path]::GetRelativePath($imageRoot, $item.FullName)
@@ -815,8 +1101,8 @@ else { $emptyIncompleteListing }
 $visualTaskDirectories = [Collections.Generic.List[IO.DirectoryInfo]]::new()
 $visualTaskPathsById = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($item in $visualDirectoryListing.Items) {
-    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-        Add-ScanIssue -Category 'visualization-directories' -Message "reparse item in asset tree: $($item.FullName)" -Critical
+    if (Test-IsUnsafeTraversalEntry -Root $visualRoot -Item $item) {
+        Add-ScanIssue -Category 'visualization-directories' -Message "unsafe link or nested mount in asset tree: $($item.FullName)" -Critical
         continue
     }
     $relative = [IO.Path]::GetRelativePath($visualRoot, $item.FullName)
@@ -882,7 +1168,8 @@ $rootsStillSafe = (
     (Test-NoReparseWithinRoot -Root $resolvedCodexRoot -LiteralPath $sessionRoot -Category 'capture-stability') -and
     (Test-NoReparseWithinRoot -Root $resolvedCodexRoot -LiteralPath $archiveRoot -Category 'capture-stability') -and
     (Test-NoReparseWithinRoot -Root $resolvedCodexRoot -LiteralPath $imageRoot -Category 'capture-stability') -and
-    (Test-NoReparseWithinRoot -Root $resolvedCodexRoot -LiteralPath $visualRoot -Category 'capture-stability')
+    (Test-NoReparseWithinRoot -Root $resolvedCodexRoot -LiteralPath $visualRoot -Category 'capture-stability') -and
+    (Test-NoReparseWithinRoot -Root $resolvedStateRoot -LiteralPath $resolvedStateRoot -Category 'capture-stability')
 )
 $sessionVerification = if ($rootsStillSafe) {
     Get-CheckedChildren -LiteralPath $sessionRoot -File -Recurse -Filter '*.jsonl' -Category 'capture-stability' -Critical
@@ -900,7 +1187,7 @@ $visualVerification = if ($rootsStillSafe) {
     Get-CheckedChildren -LiteralPath $visualRoot -Recurse -Category 'capture-stability' -Critical
 }
 else { $emptyIncompleteListing }
-$stateVerification = Get-StateSnapshot -Root $resolvedCodexRoot
+$stateVerification = Get-StateSnapshot -Root $resolvedStateRoot
 $rolloutVerificationSignature = Get-ItemSetSignature -Items @(
     Get-UnprotectedRolloutItems -Items (@($sessionVerification.Items) + @($archiveVerification.Items)) -ProtectedIds $protectedIds
 )
@@ -950,7 +1237,7 @@ if ($reviewClassificationComplete) {
                 -not $_.Protected -and
                 $_.OlderThanCutoff -and
                 $_.MeasurementComplete -and
-                $_.ReparsePoints -eq 0
+                $_.UnsafePathEntries -eq 0
             } |
             Sort-Object Path
     )
@@ -962,15 +1249,15 @@ if ($reviewClassificationComplete) {
                 -not $_.Protected -and
                 $_.OlderThanCutoff -and
                 $_.MeasurementComplete -and
-                $_.ReparsePoints -eq 0
+                $_.UnsafePathEntries -eq 0
             } |
             Sort-Object Path
     )
 }
 
-$imageReviewPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$imageReviewPaths = [Collections.Generic.HashSet[string]]::new($pathComparer)
 foreach ($record in $oldUnreferencedImageCandidates) { [void]$imageReviewPaths.Add($record.Path) }
-$visualReviewPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$visualReviewPaths = [Collections.Generic.HashSet[string]]::new($pathComparer)
 foreach ($record in $oldUnreferencedVisualCandidates) { [void]$visualReviewPaths.Add($record.Path) }
 $protectedAmbiguousImageDirectories = @(
     $imageRecords |
@@ -1017,9 +1304,20 @@ $areaRows = @(
     }
 )
 
-$databaseListing = Get-CheckedChildren -LiteralPath $resolvedCodexRoot -File -Filter '*.sqlite*' -Category 'database-list'
+$databaseRoots = [Collections.Generic.HashSet[string]]::new($pathComparer)
+[void]$databaseRoots.Add($resolvedCodexRoot)
+[void]$databaseRoots.Add($resolvedStateRoot)
+$databaseItems = [Collections.Generic.List[object]]::new()
+$databaseListingComplete = $true
+foreach ($databaseRoot in $databaseRoots) {
+    $listing = Get-CheckedChildren -LiteralPath $databaseRoot -File -Filter '*.sqlite*' -Category 'database-list'
+    if (-not $listing.Complete) { $databaseListingComplete = $false }
+    foreach ($databaseItem in $listing.Items) {
+        $databaseItems.Add($databaseItem)
+    }
+}
 $databaseRows = @(
-    $databaseListing.Items |
+    $databaseItems |
         Sort-Object Name |
         ForEach-Object {
             [pscustomobject]@{
@@ -1038,21 +1336,36 @@ $databaseRows = @(
 $reportScan = Get-ReportCandidates -Roots $ProjectRoot -Limit $Top
 $overallScanComplete = (
     $scanErrors.Count -eq 0 -and
+    $databaseListingComplete -and
     (-not $reportScan.Requested -or $reportScan.Complete)
 )
 $overallComplete = (
     $reviewClassificationComplete -and
+    $databaseListingComplete -and
     (-not $reportScan.Requested -or $reportScan.Complete)
 )
 $snapshot = [pscustomobject]@{
-    SchemaVersion = 3
+    SchemaVersion = 4
     OutputKind = 'ReadOnlyDiagnosticSnapshot'
     UsableAsActionManifest = $false
     RecordsAuthorizeDeletion = $false
     PathRecordsAuthorizeDeletion = $false
     CapturedAtUtc = $capturedAtUtc.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    Platform = [pscustomobject]@{
+        Name = $platformName
+        PathCaseSensitive = (-not $IsWindows)
+        MountInventoryComplete = $script:mountInventory.Complete
+        MountInventorySource = $script:mountInventory.Source
+        MountPointCount = $script:mountInventory.Paths.Count
+    }
     CodexRoot = [pscustomobject]@{
         Path = $resolvedCodexRoot
+        MeasurementOnly = $true
+        DeletionAuthorized = $false
+        Disposition = 'Protect'
+    }
+    StateRoot = [pscustomobject]@{
+        Path = $resolvedStateRoot
         MeasurementOnly = $true
         DeletionAuthorized = $false
         Disposition = 'Protect'
@@ -1064,6 +1377,7 @@ $snapshot = [pscustomobject]@{
     Safety = [pscustomobject]@{
         AnalysisOnly = $true
         SnapshotAuthorizesDeletion = $false
+        PlatformPathSafetyComplete = $script:mountInventory.Complete
         RolloutScanComplete = $rolloutScanComplete
         StateDatabaseComplete = $stateSnapshot.Complete
         AuthoritativeStateDatabaseResolved = $stateSnapshot.AuthoritativeResolved
@@ -1105,8 +1419,8 @@ $snapshot = [pscustomobject]@{
     }
     Rollouts = [pscustomobject]@{
         Total = $rolloutRecords.Count
-        Sessions = @($rolloutRecords | Where-Object { $_.File.FullName.StartsWith($sessionRoot, [StringComparison]::OrdinalIgnoreCase) }).Count
-        Archived = @($rolloutRecords | Where-Object { $_.File.FullName.StartsWith($archiveRoot, [StringComparison]::OrdinalIgnoreCase) }).Count
+        Sessions = @($rolloutRecords | Where-Object { $_.File.FullName.StartsWith($sessionRoot, $pathComparison) }).Count
+        Archived = @($rolloutRecords | Where-Object { $_.File.FullName.StartsWith($archiveRoot, $pathComparison) }).Count
     }
     GeneratedImages = [pscustomobject]@{
         MeasurementOnly = $true
