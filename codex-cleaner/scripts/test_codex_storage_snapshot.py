@@ -107,11 +107,17 @@ def run_snapshot(
         command.extend(["-Top", str(top)])
     completed = subprocess.run(
         command,
-        check=True,
         capture_output=True,
         text=True,
         encoding="utf-8",
     )
+    if completed.returncode != 0:
+        raise AssertionError(
+            "snapshot command failed\n"
+            f"command: {command!r}\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
     return json.loads(completed.stdout)
 
 
@@ -133,7 +139,7 @@ def main() -> int:
         assert phrase in skill_text, f"missing safety contract phrase: {phrase}"
 
     with tempfile.TemporaryDirectory(prefix="codex-cleaner-test-") as temp_name:
-        temp_root = Path(temp_name)
+        temp_root = Path(temp_name).resolve()
         codex_root = temp_root / ".codex"
         project_root = temp_root / "project"
         session_root = codex_root / "sessions" / "2026" / "01" / "01"
