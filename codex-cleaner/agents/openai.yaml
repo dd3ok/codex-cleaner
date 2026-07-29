@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Cleaner"
+  short_description: "Fail-closed Codex storage audit and cleanup"
+  default_prompt: "Use $codex-cleaner to run a fail-closed read-only storage audit, then require an expiring exact manifest and revalidation before any change."
