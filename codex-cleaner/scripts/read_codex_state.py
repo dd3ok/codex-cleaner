@@ -63,7 +63,19 @@ def main() -> None:
     connection: sqlite3.Connection | None = None
     try:
         fingerprint_before = state_fingerprint(database_path)
-        uri = f"{database_path.as_uri()}?mode=ro"
+        active_sidecars = [
+            record["path"]
+            for record in fingerprint_before[1:]
+            if record.get("exists")
+        ]
+        if active_sidecars:
+            result["errors"] = [
+                "WAL/SHM sidecars are present; require an offline, quiescent "
+                "state database before inspection"
+            ]
+            emit(result, 1)
+
+        uri = f"{database_path.as_uri()}?mode=ro&immutable=1"
         connection = sqlite3.connect(uri, uri=True, timeout=0.25)
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA busy_timeout = 250")

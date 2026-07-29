@@ -2,7 +2,9 @@
 
 [한국어 문서](README.ko.md)
 
-Codex Cleaner is a Windows-first Codex skill for auditing and reducing accumulated Codex Desktop and CLI data without silently breaking current tasks, projects, skills, settings, or unique generated assets.
+[![Cross-platform validation](https://github.com/dd3ok/codex-cleaner/actions/workflows/validate.yml/badge.svg)](https://github.com/dd3ok/codex-cleaner/actions/workflows/validate.yml)
+
+Codex Cleaner is a cross-platform Codex skill for auditing and reducing accumulated Codex Desktop and CLI data without silently breaking current tasks, projects, skills, settings, or unique generated assets. It supports Windows, macOS, Linux, and WSL.
 
 Its bundled snapshot is permanently read-only and fail-closed. A snapshot record is evidence for review, never permission to delete data.
 
@@ -15,6 +17,7 @@ Its bundled snapshot is permanently read-only and fail-closed. A snapshot record
 - Regenerable project caches and build output
 - Excess cleanup reports and audit artifacts
 - Duplicate or stale worker processes that may retain memory
+- Platform-specific symbolic links, junctions, mount points, bind mounts, and path boundaries
 
 ## Safety model
 
@@ -35,6 +38,7 @@ The skill never treats age, an archived flag, a filename, a missing project path
 
 - The current task and its connected parent/child task family
 - Global instructions, configuration, authentication, `.codex/skills`, and `.agents/skills`
+- `CODEX_HOME`, the effective SQLite state root, and unknown platform-specific app data
 - Project source, tracked files, untracked work, and repositories with changes
 - Unique, unmatched, ambiguous, or current-task generated assets
 - `state_*.sqlite` and SQLite `-wal`/`-shm` files
@@ -45,6 +49,7 @@ The skill never treats age, an archived flag, a filename, a missing project path
 
 ```text
 .
+├── .github/workflows/validate.yml
 ├── README.md
 ├── README.ko.md
 └── codex-cleaner/
@@ -52,7 +57,7 @@ The skill never treats age, an archived flag, a filename, a missing project path
     ├── agents/
     │   └── openai.yaml
     ├── references/
-    │   └── windows-storage-map.md
+    │   └── platform-storage-map.md
     └── scripts/
         ├── Get-CodexStorageSnapshot.ps1
         ├── read_codex_state.py
@@ -61,12 +66,22 @@ The skill never treats age, an archived flag, a filename, a missing project path
 
 The README files stay outside the installable skill so they are not loaded into the Codex skill context.
 
+## Supported platforms
+
+| Platform | Path safety |
+|---|---|
+| Windows | Case-insensitive containment; junction, symbolic-link, reparse-point, ADS, device, and UNC protection |
+| macOS | Conservative case-sensitive containment; symbolic-link and native mount-table protection |
+| Linux / WSL | Case-sensitive containment; symbolic-link, `/proc/self/mountinfo`, nested mount, and bind-mount protection |
+
+The snapshot fails closed when the host platform or mount inventory cannot be established.
+
 ## Requirements
 
-- Windows 10 or 11
+- Windows, macOS, or Linux
 - Codex Desktop or Codex CLI with personal skill support
 - PowerShell 7 (`pwsh`)
-- Python 3 using only the standard library
+- Python 3.10 or newer using only the standard library
 
 ## Installation
 
@@ -97,6 +112,8 @@ Copy-Item -LiteralPath '.\codex-cleaner' -Destination $destination -Recurse
 ```
 
 Restart Codex so the new skill is discovered.
+
+Codex uses `CODEX_HOME`, which defaults to `~/.codex`. SQLite state can be relocated with `CODEX_SQLITE_HOME`, while the `sqlite_home` config option takes precedence. See the official [Codex environment-variable reference](https://learn.chatgpt.com/docs/config-file/environment-variables).
 
 ## Usage
 
@@ -131,12 +148,22 @@ pwsh -NoProfile -File $snapshotScript `
   -AsJson
 ```
 
+If SQLite state is stored outside `CODEX_HOME`, pass the effective location explicitly:
+
+```powershell
+pwsh -NoProfile -File $snapshotScript `
+  -CurrentTaskId '<current-task-uuid>' `
+  -StateRoot '<effective-sqlite-state-root>' `
+  -AsJson
+```
+
 The snapshot permits review classification only when all safety gates pass:
 
 - `ScanComplete`
 - `ReviewClassificationComplete`
 - `Safety.TaskConsistencyValid`
 - `Safety.AuthoritativeStateDatabaseResolved`
+- `Safety.PlatformPathSafetyComplete`
 - `Safety.CaptureStable`
 - `Safety.CurrentTaskProtectionProvided`
 - an empty `Errors` collection
@@ -151,7 +178,7 @@ Run the isolated regression suite:
 python -I -B .\codex-cleaner\scripts\test_codex_storage_snapshot.py
 ```
 
-The suite uses synthetic temporary Codex trees. It covers state/rollout consistency, active SQLite WAL handling, duplicate and missing records, generated-asset ambiguity, current-task graph protection, reparse points, parent junctions, and multiple state databases. It must not modify live Codex data.
+The suite uses synthetic temporary Codex trees. It covers state/rollout consistency, relocated SQLite state, mutation-free active-WAL refusal, duplicate and missing records, generated-asset ambiguity, current-task graph protection, symbolic links or Windows junctions, and multiple state databases. GitHub Actions runs it on Windows, Ubuntu, and macOS. It must not modify live Codex data.
 
 ## Important limitations
 
@@ -159,8 +186,10 @@ The suite uses synthetic temporary Codex trees. It covers state/rollout consiste
 - The snapshot itself contains no destructive primitives.
 - Historical content and regenerable data always require an exact later selection.
 - Task deletion must use a supported Codex task interface, not direct state-database edits.
+- State inspection requires an offline, quiescent database when WAL/SHM sidecars are present.
 - SQLite log maintenance is allowed only during a confirmed offline window; state databases are never compacted.
 - The skill does not run in the background or create scheduled cleanup automatically.
-- Codex storage schemas and supported management interfaces may change; unknown layouts are protected.
+- Platform-specific app cache paths are discovered from installed processes and supported configuration rather than guessed.
+- Codex storage schemas, mount behavior, and supported management interfaces may change; unknown layouts are protected.
 
-Contributions and reproducible Windows edge cases are welcome through GitHub issues and pull requests.
+Contributions and reproducible Windows, macOS, Linux, and WSL edge cases are welcome through GitHub issues and pull requests.

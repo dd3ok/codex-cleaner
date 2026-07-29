@@ -1,0 +1,56 @@
+name: Cross-platform validation
+
+on:
+  push:
+    branches:
+      - main
+      - "agent/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Show runtime versions
+        shell: pwsh
+        run: |
+          $PSVersionTable.PSVersion
+          python --version
+
+      - name: Parse PowerShell snapshot
+        shell: pwsh
+        run: |
+          $parseErrors = $null
+          $snapshot = Resolve-Path ./codex-cleaner/scripts/Get-CodexStorageSnapshot.ps1
+          [void][Management.Automation.Language.Parser]::ParseFile(
+            $snapshot,
+            [ref]$null,
+            [ref]$parseErrors
+          )
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | Format-List Message, Extent
+            throw "PowerShell parser errors: $($parseErrors.Count)"
+          }
+
+      - name: Run isolated safety regression
+        shell: pwsh
+        run: python -I -B ./codex-cleaner/scripts/test_codex_storage_snapshot.py
