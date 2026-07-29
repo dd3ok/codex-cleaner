@@ -160,7 +160,8 @@ function Get-PlatformMountInventory {
         }
     }
 
-    $mountCommand = Get-Command mount -CommandType Application -ErrorAction SilentlyContinue
+    $mountCommand = Get-Command mount -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     if ($null -eq $mountCommand) {
         $errors.Add('mount command is unavailable')
     }
@@ -570,13 +571,14 @@ function Get-StateSnapshot {
         return [pscustomobject]@{ Complete = $false; AuthoritativeResolved = $false; Database = $databases[0]; Threads = @(); Edges = @() }
     }
 
-    $python = Get-Command python -CommandType Application -ErrorAction SilentlyContinue
+    $python = Get-Command python -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     $helper = Join-Path $PSScriptRoot 'read_codex_state.py'
     if ($null -eq $python -or -not (Test-Path -LiteralPath $helper -PathType Leaf)) {
         Add-ScanIssue -Category 'state-database' -Message 'Python or read_codex_state.py is unavailable' -Critical
         return [pscustomobject]@{ Complete = $false; AuthoritativeResolved = $false; Database = $databases[0]; Threads = @(); Edges = @() }
     }
-    $pythonPath = Resolve-ExecutablePath -LiteralPath $python.Source
+    $pythonPath = Resolve-ExecutablePath -LiteralPath ([string]$python.Path)
     $pythonRoot = [IO.Path]::GetPathRoot($pythonPath)
     $helperPath = [IO.Path]::GetFullPath($helper)
     $helperRoot = [IO.Path]::GetPathRoot($helperPath)
