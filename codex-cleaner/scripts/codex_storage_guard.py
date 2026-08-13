@@ -445,32 +445,36 @@ def assess_storage(
         "doctor": {"status": "not-requested"},
     }
     if codex_client is not None:
-        adapter_error = None
+        handshake_error = None
+        diagnostic_error = None
         try:
             codex["version"] = codex_client.version()
         except GuardError as exc:
             codex["versionError"] = exc.code
-            adapter_error = exc.code
-        if include_doctor and adapter_error is None:
+            handshake_error = exc.code
+        if include_doctor and handshake_error is None:
             try:
                 codex["doctor"] = codex_client.doctor()
             except GuardError as exc:
                 codex["doctor"] = {"available": False, "error": exc.code}
-                adapter_error = exc.code
+                diagnostic_error = exc.code
         elif include_doctor:
-            codex["doctor"] = {"available": False, "error": adapter_error}
-        if adapter_error is None:
+            codex["doctor"] = {"available": False, "error": handshake_error}
+        if handshake_error is None:
             codex["capabilities"] = {
                 action: codex_client.probe_capability(action)
                 for action in KNOWN_TASK_ACTIONS
             }
-            codex["available"] = all(
-                capability["status"] == "supported"
-                for capability in codex["capabilities"].values()
+            codex["available"] = (
+                diagnostic_error is None
+                and all(
+                    capability["status"] == "supported"
+                    for capability in codex["capabilities"].values()
+                )
             )
         else:
             codex["capabilities"] = {
-                action: {"status": "unknown", "reason": adapter_error}
+                action: {"status": "unknown", "reason": handshake_error}
                 for action in KNOWN_TASK_ACTIONS
             }
     else:

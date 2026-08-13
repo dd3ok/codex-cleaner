@@ -220,6 +220,9 @@ class StorageGuardTests(unittest.TestCase):
 
         self.assertEqual(result["codex"]["doctor"]["error"], "doctor-invalid")
         self.assertFalse(result["codex"]["available"])
+        self.assertEqual(
+            result["codex"]["capabilities"]["archive"], {"status": "supported"}
+        )
         self.assertFalse(result["safety"]["authorizesDeletion"])
 
     def test_failed_capability_probe_marks_optional_adapter_unavailable(self) -> None:
