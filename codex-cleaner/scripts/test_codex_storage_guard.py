@@ -137,7 +137,10 @@ class StorageGuardTests(unittest.TestCase):
                 {Path(item["path"]).name for item in result["largestFiles"]},
             )
         finally:
-            os.rmdir(link)
+            if os.name == "nt":
+                os.rmdir(link)
+            else:
+                link.unlink()
 
     def test_external_state_scope_is_explicit(self) -> None:
         previous = os.environ.get("CODEX_SQLITE_HOME")
