@@ -4,7 +4,7 @@
 
 [![크로스플랫폼 검증](https://github.com/dd3ok/codex-cleaner/actions/workflows/validate.yml/badge.svg)](https://github.com/dd3ok/codex-cleaner/actions/workflows/validate.yml)
 
-Codex Storage Guard는 `codex-cleaner` 개인 스킬에서 안전한 읽기 전용 핵심만 남긴 도구입니다. `CODEX_HOME`을 내부 형식을 모르는 파일시스템 데이터로 측정하고, 공식 최상위 `codex doctor --json` 결과와 결합합니다. 비공개 Codex 데이터베이스나 rollout 형식을 해석하지 않으며 정리 기능도 포함하지 않습니다.
+Codex Storage Guard는 `codex-cleaner` 개인 스킬에서 안전한 읽기 전용 핵심만 남긴 도구입니다. `CODEX_HOME`을 내부 형식을 모르는 파일시스템 데이터로 측정하고, 요청한 경우에만 공식 최상위 `codex doctor --json` 결과를 덧붙입니다. 비공개 Codex 데이터베이스나 rollout 형식을 해석하지 않으며 정리 기능도 포함하지 않습니다.
 
 ## 존재 이유
 
@@ -15,17 +15,17 @@ Codex Storage Guard는 `codex-cleaner` 개인 스킬에서 안전한 읽기 전�
 - 영역 이름을 하드코딩하지 않고 측정한 `CODEX_HOME` 직속 항목별 apparent bytes
 - 탐색 중 확인한 가장 큰 파일
 - 건너뛴 링크·mount·특수 파일·경합과 그 밖의 coverage 제한
-- 인식 가능한 `codex doctor --json` 상태
+- 명시적으로 요청했을 때 인식 가능한 `codex doctor --json` 상태
 - `archive`, `delete`, `unarchive` 명령에 대한 3상태 capability probe
 - archive와 delete 자동화를 차단하는 명시적 정책
 
-결과는 실행 중 파일 메타데이터를 최선으로 관찰한 값입니다. 원자적 스냅샷, 실제 할당 디스크 용량, 회수 가능 용량 또는 시스템 전체 목록이 아닙니다. `CODEX_HOME` 밖에 설정된 실제 상태 루트는 탐색하지 않습니다.
+결과는 실행 중 파일 메타데이터를 최선으로 관찰한 값입니다. 원자적 스냅샷, 실제 할당 디스크 용량, 회수 가능 용량 또는 시스템 전체 목록이 아닙니다. `CODEX_HOME` 밖에 설정된 실제 상태 루트는 탐색하지 않습니다. 설정의 `sqlite_home`이 `CODEX_SQLITE_HOME`보다 우선하며, `log_dir`도 외부 경로일 수 있습니다.
 
 ## Task lifecycle 경계
 
 현재 안정 버전의 `archive`와 `delete`는 선택한 task의 하위 spawned task에도 영향을 줄 수 있지만, 같은 작업에 결박할 수 있는 영향 task 전체 미리보기는 안정 인터페이스에 없습니다. 따라서 이 스킬은 두 명령의 계획을 만들거나 실행하지 않습니다. 루트 task를 정확히 승인하거나 사용자가 위험을 수락해도 전체 영향 집합이 증명되지는 않습니다.
 
-`unarchive`는 되돌릴 수 있지만 저장공간 정리가 아닙니다. 명시적으로 요청한 경우 공식 Codex task 인터페이스를 직접 사용합니다.
+`unarchive`는 task 저장공간을 변경하며 정리 작업이 아닙니다. 이 스킬은 실행하지 않습니다. 명령이 존재하고 영구 삭제가 아니라는 사실만으로 동시성 안전성이 증명되지는 않습니다. 별도 요청은 설치 버전과 active writer 안전성을 확인한 뒤 공식 Codex task 인터페이스로만 처리합니다.
 
 이 스킬은 원시 파일 삭제, 비공개 SQLite 스키마 검사, orphan 자산 분류, 로그 vacuum, 프로세스 종료, 프로젝트 캐시 정리 또는 플러그인 관리를 하지 않습니다.
 
@@ -58,16 +58,20 @@ Codex Storage Guard는 `codex-cleaner` 개인 스킬에서 안전한 읽기 전�
 git clone https://github.com/dd3ok/codex-cleaner.git
 Set-Location .\codex-cleaner
 
-$codexHome = if ($env:CODEX_HOME) {
-  $env:CODEX_HOME
-} else {
-  Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex'
-}
-$skillParent = Join-Path $codexHome 'skills'
+$userHome = [Environment]::GetFolderPath('UserProfile')
+$skillParent = Join-Path $userHome '.agents\skills'
 $destination = Join-Path $skillParent 'codex-cleaner'
+$legacy = if ($env:CODEX_HOME) {
+  Join-Path $env:CODEX_HOME 'skills\codex-cleaner'
+} else {
+  Join-Path $userHome '.codex\skills\codex-cleaner'
+}
 
 if (Test-Path -LiteralPath $destination) {
   throw "A codex-cleaner skill already exists at $destination. Review it before replacing it."
+}
+if (Test-Path -LiteralPath $legacy) {
+  throw "A legacy installation exists at $legacy. Move or remove it before installing to avoid duplicate skill names."
 }
 
 New-Item -ItemType Directory -Path $skillParent -Force | Out-Null
@@ -90,7 +94,7 @@ $codex-cleaner로 Codex 저장공간을 읽기 전용으로 점검해줘.
 python -I -B .\codex-cleaner\scripts\codex_storage_guard.py
 ```
 
-기본값이 맞지 않을 때만 `--codex-home`, `--codex-executable`, `--top`을 사용합니다. 현재 인터페이스는 `--help`로 확인할 수 있습니다. 스크립트는 JSON assessment 하나를 표준 출력에 기록합니다.
+기본값이 맞지 않을 때만 `--codex-home`, `--codex-executable`, `--top`을 사용합니다. 설치나 상태 진단까지 요청한 경우에만 `--doctor`를 추가합니다. doctor는 네트워크와 provider reachability 점검을 포함할 수 있습니다. 현재 인터페이스는 `--help`로 확인할 수 있습니다. 스크립트는 JSON assessment 하나를 표준 출력에 기록합니다. 설치된 Codex launcher를 안전하게 검증하지 못해도 불투명한 저장공간 측정은 계속하고 CLI adapter만 unavailable로 표시합니다.
 
 ## 검증
 

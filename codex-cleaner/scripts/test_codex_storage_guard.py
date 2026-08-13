@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -16,6 +17,7 @@ import codex_storage_guard as guard
 class FakeRunner:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.contexts: list[dict[str, object]] = []
         self.help_exit_codes: dict[str, int] = {}
         self.doctor_payload: object = {
             "schemaVersion": 1,
@@ -27,6 +29,9 @@ class FakeRunner:
     def run(self, argv, *, cwd, env, timeout_seconds):
         args = [str(value) for value in argv]
         self.calls.append(args)
+        self.contexts.append(
+            {"cwd": Path(cwd), "env": dict(env), "timeoutSeconds": timeout_seconds}
+        )
         tail = args[1:]
         if tail == ["--version"]:
             return guard.CommandResult(0, "codex-cli 0.147.0\n", "", False)
@@ -56,7 +61,10 @@ class StorageGuardTests(unittest.TestCase):
             self.binary.chmod(0o700)
         self.runner = FakeRunner()
         self.client = guard.CodexClient(
-            self.binary, self.codex_home, runner=self.runner
+            self.binary,
+            self.codex_home,
+            probe_cwd=self.root,
+            runner=self.runner,
         )
 
     def tearDown(self) -> None:
@@ -156,8 +164,17 @@ class StorageGuardTests(unittest.TestCase):
         coverage = result["coverage"]
         self.assertFalse(coverage["externalStateRootsMeasured"])
         self.assertEqual(
-            coverage["externalStateRootEnvironmentHint"],
+            coverage["sqliteHomeEnvironmentHint"],
             str(self.root / "external-state"),
+        )
+        self.assertNotIn("externalStateRootEnvironmentHint", coverage)
+
+    def test_doctor_is_opt_in_and_not_run_by_default(self) -> None:
+        result = guard.assess_storage(self.codex_home, codex_client=self.client, top=0)
+
+        self.assertEqual(result["codex"]["doctor"], {"status": "not-requested"})
+        self.assertNotIn(
+            [str(self.binary.resolve()), "doctor", "--json"], self.runner.calls
         )
 
     def test_unknown_doctor_schema_is_reported_not_interpreted(self) -> None:
@@ -168,10 +185,18 @@ class StorageGuardTests(unittest.TestCase):
             "checks": {"completely": "different"},
         }
 
-        result = guard.assess_storage(self.codex_home, codex_client=self.client, top=0)
+        result = guard.assess_storage(
+            self.codex_home,
+            codex_client=self.client,
+            include_doctor=True,
+            top=0,
+        )
 
         self.assertEqual(result["codex"]["doctor"]["schemaVersion"], 2)
         self.assertFalse(result["codex"]["doctor"]["schemaRecognized"])
+        self.assertTrue(result["codex"]["doctor"]["available"])
+        self.assertNotIn("overallStatus", result["codex"]["doctor"])
+        self.assertNotIn("codexVersion", result["codex"]["doctor"])
         self.assertEqual(
             result["codex"]["guardPolicy"]["delete"],
             "blocked-affected-set-preview-unavailable",
@@ -180,10 +205,23 @@ class StorageGuardTests(unittest.TestCase):
     def test_malformed_doctor_does_not_break_read_only_inventory(self) -> None:
         self.runner.doctor_payload = ["wrong shape"]
 
-        result = guard.assess_storage(self.codex_home, codex_client=self.client, top=0)
+        result = guard.assess_storage(
+            self.codex_home,
+            codex_client=self.client,
+            include_doctor=True,
+            top=0,
+        )
 
         self.assertEqual(result["codex"]["doctor"]["error"], "doctor-invalid")
         self.assertFalse(result["safety"]["authorizesDeletion"])
+
+    def test_probe_uses_caller_selected_cwd(self) -> None:
+        self.client.version()
+
+        self.assertEqual(self.runner.contexts[-1]["cwd"], self.root)
+        self.assertEqual(
+            self.runner.contexts[-1]["env"]["CODEX_HOME"], str(self.codex_home)
+        )
 
     def test_capability_probe_is_advisory_and_no_mutator_exists(self) -> None:
         result = guard.assess_storage(self.codex_home, codex_client=self.client, top=0)
@@ -199,6 +237,10 @@ class StorageGuardTests(unittest.TestCase):
         self.assertFalse(hasattr(self.client, "run_action"))
         self.assertFalse(hasattr(guard, "create_plan"))
         self.assertFalse(hasattr(guard, "apply_plan"))
+        self.assertEqual(
+            result["codex"]["guardPolicy"]["unarchive"],
+            "outside-storage-cleanup-not-run-by-this-skill",
+        )
 
     def test_capability_probe_failure_is_unknown_and_isolated(self) -> None:
         self.runner.help_exit_codes["delete"] = 9
@@ -219,6 +261,35 @@ class StorageGuardTests(unittest.TestCase):
             guard.scan_storage(missing)
         self.assertEqual(raised.exception.code, "codex-home-unavailable")
         self.assertFalse(missing.exists())
+
+    def test_unsafe_optional_codex_launcher_does_not_block_inventory(self) -> None:
+        unsafe = self.root / ("codex.cmd" if os.name == "nt" else "codex-wrapper")
+        unsafe.write_text("unsafe wrapper", encoding="utf-8")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        previous_stdout, previous_stderr = sys.stdout, sys.stderr
+        try:
+            sys.stdout, sys.stderr = stdout, stderr
+            exit_code = guard.main(
+                [
+                    "--codex-home",
+                    str(self.codex_home),
+                    "--codex-executable",
+                    str(unsafe),
+                    "--top",
+                    "0",
+                ]
+            )
+        finally:
+            sys.stdout, sys.stderr = previous_stdout, previous_stderr
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["root"], str(self.codex_home.resolve()))
+        self.assertFalse(payload["codex"]["available"])
+        self.assertEqual(payload["codex"]["error"], "unsafe-codex-executable")
 
 
 if __name__ == "__main__":

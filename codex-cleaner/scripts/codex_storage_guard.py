@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-ASSESSMENT_SCHEMA_VERSION = 2
+ASSESSMENT_SCHEMA_VERSION = 3
 SUPPORTED_DOCTOR_SCHEMA = 1
 KNOWN_TASK_ACTIONS = ("archive", "delete", "unarchive")
 
@@ -156,10 +156,12 @@ class CodexClient:
         executable: Path,
         codex_home: Path,
         *,
+        probe_cwd: Path | None = None,
         runner: Any | None = None,
     ) -> None:
         self.executable = _canonical_executable(executable)
         self.codex_home = _canonical_directory(codex_home, kind="codex-home")
+        self.probe_cwd = _absolute(probe_cwd if probe_cwd is not None else Path.cwd())
         self.runner = runner if runner is not None else SubprocessRunner()
 
     def _run(self, *args: str, timeout_seconds: int = 60) -> CommandResult:
@@ -167,7 +169,7 @@ class CodexClient:
         environment["CODEX_HOME"] = str(self.codex_home)
         return self.runner.run(
             [str(self.executable), *args],
-            cwd=self.codex_home,
+            cwd=self.probe_cwd,
             env=environment,
             timeout_seconds=timeout_seconds,
         )
@@ -197,14 +199,19 @@ class CodexClient:
             raise GuardError(
                 "doctor-invalid", "Doctor schemaVersion is missing or invalid"
             )
-        if not isinstance(status, str) or not isinstance(version, str):
-            raise GuardError("doctor-invalid", "Doctor status or version is missing")
-        return {
+        summary = {
+            "available": True,
             "schemaVersion": schema,
             "schemaRecognized": schema == SUPPORTED_DOCTOR_SCHEMA,
-            "overallStatus": status,
-            "codexVersion": version,
         }
+        if schema != SUPPORTED_DOCTOR_SCHEMA:
+            summary["reason"] = "schema-unrecognized"
+            return summary
+        if not isinstance(status, str) or not isinstance(version, str):
+            raise GuardError("doctor-invalid", "Doctor status or version is missing")
+        summary["overallStatus"] = status
+        summary["codexVersion"] = version
+        return summary
 
     def probe_capability(self, action: str) -> dict[str, str]:
         if action not in KNOWN_TASK_ACTIONS:
@@ -406,7 +413,7 @@ def scan_storage(codex_home: Path, top: int = 20) -> dict[str, Any]:
             "scope": "codex-home-only",
             "completeWithinRoot": complete_within_root,
             "externalStateRootsMeasured": False,
-            "externalStateRootEnvironmentHint": os.environ.get("CODEX_SQLITE_HOME"),
+            "sqliteHomeEnvironmentHint": os.environ.get("CODEX_SQLITE_HOME"),
         },
         "limitations": limitations,
         "measurementNotes": [
@@ -414,6 +421,7 @@ def scan_storage(codex_home: Path, top: int = 20) -> dict[str, Any]:
             "The live scan is not an atomic snapshot and never authorizes deletion.",
             "Links and mounts are skipped when observed; stdlib traversal is not race-free.",
             "Completeness applies only to CODEX_HOME; state roots configured elsewhere are not measured.",
+            "sqlite_home configuration takes precedence over CODEX_SQLITE_HOME, and log_dir may also be external.",
         ],
         "safety": {
             "analysisOnly": True,
@@ -428,27 +436,37 @@ def assess_storage(
     codex_home: Path,
     *,
     codex_client: CodexClient | None = None,
+    include_doctor: bool = False,
     top: int = 20,
 ) -> dict[str, Any]:
     assessment = scan_storage(codex_home, top=top)
-    codex: dict[str, Any] = {"available": codex_client is not None}
+    codex: dict[str, Any] = {
+        "available": codex_client is not None,
+        "doctor": {"status": "not-requested"},
+    }
     if codex_client is not None:
         try:
             codex["version"] = codex_client.version()
         except GuardError as exc:
             codex["versionError"] = exc.code
-        try:
-            codex["doctor"] = codex_client.doctor()
-        except GuardError as exc:
-            codex["doctor"] = {"available": False, "error": exc.code}
+        if include_doctor:
+            try:
+                codex["doctor"] = codex_client.doctor()
+            except GuardError as exc:
+                codex["doctor"] = {"available": False, "error": exc.code}
         codex["capabilities"] = {
             action: codex_client.probe_capability(action)
+            for action in KNOWN_TASK_ACTIONS
+        }
+    else:
+        codex["capabilities"] = {
+            action: {"status": "unknown", "reason": "codex-unavailable"}
             for action in KNOWN_TASK_ACTIONS
         }
     codex["guardPolicy"] = {
         "archive": "blocked-affected-set-preview-unavailable",
         "delete": "blocked-affected-set-preview-unavailable",
-        "unarchive": "outside-storage-cleanup-use-official-interface",
+        "unarchive": "outside-storage-cleanup-not-run-by-this-skill",
     }
     assessment["codex"] = codex
     return assessment
@@ -470,11 +488,12 @@ def _resolve_codex_executable(value: str | None) -> Path | None:
     return Path(discovered) if discovered else None
 
 
-def _emit_json(value: object, *, stream: Any = sys.stdout) -> None:
+def _emit_json(value: object, *, stream: Any | None = None) -> None:
+    target = sys.stdout if stream is None else stream
     json.dump(
-        value, stream, ensure_ascii=False, allow_nan=False, sort_keys=True, indent=2
+        value, target, ensure_ascii=False, allow_nan=False, sort_keys=True, indent=2
     )
-    stream.write("\n")
+    target.write("\n")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -483,6 +502,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--codex-home")
     parser.add_argument("--codex-executable")
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run the broader redacted Codex diagnostic, including reachability checks.",
+    )
     parser.add_argument("--top", type=int, default=20)
     return parser
 
@@ -492,8 +516,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         home = _resolve_codex_home(args.codex_home)
         executable = _resolve_codex_executable(args.codex_executable)
-        client = CodexClient(executable, home) if executable is not None else None
-        _emit_json(assess_storage(home, codex_client=client, top=args.top))
+        client = None
+        client_error = None
+        if executable is not None:
+            try:
+                client = CodexClient(executable, home, probe_cwd=Path.cwd())
+            except GuardError as exc:
+                client_error = exc.code
+        assessment = assess_storage(
+            home,
+            codex_client=client,
+            include_doctor=args.doctor,
+            top=args.top,
+        )
+        if client_error is not None:
+            assessment["codex"]["error"] = client_error
+        _emit_json(assessment)
         return 0
     except GuardError as exc:
         _emit_json(
