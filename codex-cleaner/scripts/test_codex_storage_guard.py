@@ -19,6 +19,7 @@ class FakeRunner:
         self.calls: list[list[str]] = []
         self.contexts: list[dict[str, object]] = []
         self.help_exit_codes: dict[str, int] = {}
+        self.version_exit_code = 0
         self.doctor_payload: object = {
             "schemaVersion": 1,
             "overallStatus": "ok",
@@ -34,7 +35,12 @@ class FakeRunner:
         )
         tail = args[1:]
         if tail == ["--version"]:
-            return guard.CommandResult(0, "codex-cli 0.147.0\n", "", False)
+            return guard.CommandResult(
+                self.version_exit_code,
+                "codex-cli 0.147.0\n" if self.version_exit_code == 0 else "",
+                "simulated failure" if self.version_exit_code else "",
+                False,
+            )
         if tail == ["doctor", "--json"]:
             return guard.CommandResult(0, json.dumps(self.doctor_payload), "", False)
         if len(tail) == 2 and tail[1] == "--help":
@@ -213,7 +219,40 @@ class StorageGuardTests(unittest.TestCase):
         )
 
         self.assertEqual(result["codex"]["doctor"]["error"], "doctor-invalid")
+        self.assertFalse(result["codex"]["available"])
         self.assertFalse(result["safety"]["authorizesDeletion"])
+
+    def test_failed_capability_probe_marks_optional_adapter_unavailable(self) -> None:
+        self.runner.help_exit_codes["delete"] = 1
+
+        result = guard.assess_storage(self.codex_home, codex_client=self.client, top=0)
+
+        self.assertFalse(result["codex"]["available"])
+        self.assertEqual(
+            result["codex"]["capabilities"]["delete"],
+            {"status": "unknown", "reason": "probe-nonzero"},
+        )
+
+    def test_failed_version_probe_isolated_from_inventory_and_other_probes(self) -> None:
+        self.runner.version_exit_code = 1
+
+        result = guard.assess_storage(
+            self.codex_home,
+            codex_client=self.client,
+            include_doctor=True,
+            top=0,
+        )
+
+        self.assertFalse(result["codex"]["available"])
+        self.assertEqual(
+            result["codex"]["doctor"],
+            {"available": False, "error": "codex-version-unavailable"},
+        )
+        self.assertEqual(
+            result["codex"]["capabilities"]["archive"],
+            {"status": "unknown", "reason": "codex-version-unavailable"},
+        )
+        self.assertEqual(len(self.runner.calls), 1)
 
     def test_probe_uses_caller_selected_cwd(self) -> None:
         self.client.version()
@@ -277,6 +316,7 @@ class StorageGuardTests(unittest.TestCase):
                     str(self.codex_home),
                     "--codex-executable",
                     str(unsafe),
+                    "--doctor",
                     "--top",
                     "0",
                 ]
@@ -290,6 +330,10 @@ class StorageGuardTests(unittest.TestCase):
         self.assertEqual(payload["root"], str(self.codex_home.resolve()))
         self.assertFalse(payload["codex"]["available"])
         self.assertEqual(payload["codex"]["error"], "unsafe-codex-executable")
+        self.assertEqual(
+            payload["codex"]["doctor"],
+            {"available": False, "error": "codex-unavailable"},
+        )
 
 
 if __name__ == "__main__":

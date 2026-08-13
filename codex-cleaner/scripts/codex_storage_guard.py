@@ -441,24 +441,44 @@ def assess_storage(
 ) -> dict[str, Any]:
     assessment = scan_storage(codex_home, top=top)
     codex: dict[str, Any] = {
-        "available": codex_client is not None,
+        "available": False,
         "doctor": {"status": "not-requested"},
     }
     if codex_client is not None:
+        adapter_error = None
         try:
             codex["version"] = codex_client.version()
         except GuardError as exc:
             codex["versionError"] = exc.code
-        if include_doctor:
+            adapter_error = exc.code
+        if include_doctor and adapter_error is None:
             try:
                 codex["doctor"] = codex_client.doctor()
             except GuardError as exc:
                 codex["doctor"] = {"available": False, "error": exc.code}
-        codex["capabilities"] = {
-            action: codex_client.probe_capability(action)
-            for action in KNOWN_TASK_ACTIONS
-        }
+                adapter_error = exc.code
+        elif include_doctor:
+            codex["doctor"] = {"available": False, "error": adapter_error}
+        if adapter_error is None:
+            codex["capabilities"] = {
+                action: codex_client.probe_capability(action)
+                for action in KNOWN_TASK_ACTIONS
+            }
+            codex["available"] = all(
+                capability["status"] == "supported"
+                for capability in codex["capabilities"].values()
+            )
+        else:
+            codex["capabilities"] = {
+                action: {"status": "unknown", "reason": adapter_error}
+                for action in KNOWN_TASK_ACTIONS
+            }
     else:
+        if include_doctor:
+            codex["doctor"] = {
+                "available": False,
+                "error": "codex-unavailable",
+            }
         codex["capabilities"] = {
             action: {"status": "unknown", "reason": "codex-unavailable"}
             for action in KNOWN_TASK_ACTIONS
