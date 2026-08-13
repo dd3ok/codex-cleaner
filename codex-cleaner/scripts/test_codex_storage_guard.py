@@ -262,7 +262,8 @@ class StorageGuardTests(unittest.TestCase):
 
         self.assertEqual(self.runner.contexts[-1]["cwd"], self.root)
         self.assertEqual(
-            self.runner.contexts[-1]["env"]["CODEX_HOME"], str(self.codex_home)
+            self.runner.contexts[-1]["env"]["CODEX_HOME"],
+            str(self.codex_home.resolve()),
         )
 
     def test_capability_probe_is_advisory_and_no_mutator_exists(self) -> None:
