@@ -36,21 +36,6 @@ jobs:
           $PSVersionTable.PSVersion
           python --version
 
-      - name: Parse PowerShell snapshot
-        shell: pwsh
-        run: |
-          $parseErrors = $null
-          $snapshot = Resolve-Path ./codex-cleaner/scripts/Get-CodexStorageSnapshot.ps1
-          [void][Management.Automation.Language.Parser]::ParseFile(
-            $snapshot,
-            [ref]$null,
-            [ref]$parseErrors
-          )
-          if ($parseErrors.Count -gt 0) {
-            $parseErrors | Format-List Message, Extent
-            throw "PowerShell parser errors: $($parseErrors.Count)"
-          }
-
       - name: Run isolated safety regression
         shell: pwsh
-        run: python -I -B ./codex-cleaner/scripts/test_codex_storage_snapshot.py
+        run: python -I -B ./codex-cleaner/scripts/test_codex_storage_guard.py
